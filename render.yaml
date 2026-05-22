@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: vacantrix-telegram-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PROVIDER_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: VERSIONS_GROUP_ID
+        sync: false
+      - key: INSTRUCTION_URL
+        sync: false
