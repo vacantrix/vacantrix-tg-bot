@@ -1,8 +1,8 @@
 # vacantrix/telegram/supabase.py
-"""Функции работы с Supabase (включая реферальную систему, хранение последней версии и напоминания)."""
+"""Функции работы с Supabase (пользователи бота — только чтение подписки как справка)."""
 
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import requests
 
@@ -55,14 +55,10 @@ def get_user_by_applicant(applicant_id):
     return rows[0] if rows else None
 
 
-def create_user(telegram_id, applicant_id=None, referral_code=None, referred_by=None):
+def create_user(telegram_id, applicant_id=None):
     data = {"telegram_id": telegram_id}
     if applicant_id:
         data["applicant_id"] = applicant_id
-    if referral_code:
-        data["referral_code"] = referral_code
-    if referred_by:
-        data["referred_by"] = referred_by
     return supabase_post("users", data)
 
 
@@ -71,50 +67,34 @@ def link_applicant(telegram_id, applicant_id):
                           {"applicant_id": applicant_id})
 
 
-def update_subscription(applicant_id, expire_date):
-    return supabase_patch("users", {"applicant_id": applicant_id},
-                          {"subscription_expire": expire_date.isoformat()})
+def redeem_link_code(code: str, telegram_chat_id: int, channel: str = "telegram"):
+    """Погасить одноразовый код линковки и записать chat_id в notify_channels.
 
-
-def update_subscription_by_telegram(telegram_id, expire_date):
-    return supabase_patch("users", {"telegram_id": telegram_id},
-                          {"subscription_expire": expire_date.isoformat()})
-
-
-def count_referrals(referral_code):
-    rows = supabase_get("users", {"referred_by": f"eq.{referral_code}"})
-    return len(rows) if rows else 0
-
-
-def get_referrer_telegram_id(user_telegram_id: int):
-    user = get_user_by_telegram(user_telegram_id)
-    if not user:
+    Вызывается из /start <code> (deep-link из приложения). Возвращает user_id при
+    успехе, None — если код неверный/использован/ошибка. Работает service_role'ом
+    (обходит RLS notify_link_codes/notify_channels)."""
+    if not code or len(code) > 32:
         return None
-    referred_by = user.get("referred_by")
-    if not referred_by:
-        return None
-    rows = supabase_get("users", {"referral_code": f"eq.{referred_by}"})
-    if rows:
-        return rows[0].get("telegram_id")
-    return None
-
-
-def add_subscription_days(telegram_id: int, days: int):
-    user = get_user_by_telegram(telegram_id)
-    if not user:
-        return None
-    current_expire = user.get("subscription_expire")
-    now = datetime.now(timezone.utc)
-    if current_expire:
-        expire_dt = datetime.fromisoformat(current_expire.replace("Z", "+00:00"))
-        if expire_dt > now:
-            start_date = expire_dt
-        else:
-            start_date = now
+    rows = supabase_get("notify_link_codes", {
+        "code": f"eq.{code}", "used": "eq.false", "channel": f"eq.{channel}",
+        "select": "user_id,channel"})
+    if not rows:
+        return None                              # неверный/использованный код
+    uid = rows[0]["user_id"]
+    field = "telegram_chat_id" if channel == "telegram" else "max_user_id"
+    at_field = "telegram_linked_at" if channel == "telegram" else "max_linked_at"
+    now = datetime.now(timezone.utc).isoformat()
+    data = {field: telegram_chat_id, at_field: now}
+    existing = supabase_get("notify_channels", {"user_id": f"eq.{uid}", "select": "user_id"})
+    if existing:
+        resp = supabase_patch("notify_channels", {"user_id": uid}, data)
     else:
-        start_date = now
-    new_expire = start_date + timedelta(days=days)
-    return update_subscription_by_telegram(telegram_id, new_expire)
+        data["user_id"] = uid
+        resp = supabase_post("notify_channels", data)
+    if not (resp and resp.ok):
+        return None
+    supabase_patch("notify_link_codes", {"code": code}, {"used": True})
+    return uid
 
 
 def check_subscription_status(profile):
@@ -134,78 +114,12 @@ def check_subscription_status(profile):
     return "❌ Истекла"
 
 
-# ---------- Функции для хранения последней версии файла ----------
-def save_latest_version(chat_id: int, message_id: int, file_name: str = ""):
-    try:
-        existing = supabase_get("latest_version", {"id": "eq.1"})
-        if existing:
-            return supabase_patch("latest_version", {"id": 1},
-                                  {"chat_id": chat_id, "message_id": message_id,
-                                   "file_name": file_name, "updated_at": "now()"})
-        else:
-            return supabase_post("latest_version",
-                                 {"id": 1, "chat_id": chat_id, "message_id": message_id,
-                                  "file_name": file_name})
-    except Exception as e:
-        logger.error(f"Ошибка сохранения последней версии: {e}")
-        return None
-
-
-def get_latest_version():
-    rows = supabase_get("latest_version", {"id": "eq.1"})
-    if rows:
-        row = rows[0]
-        return row.get("chat_id"), row.get("message_id")
-    return None, None
-
-
-# ---------- Функции для напоминаний об окончании подписки ----------
-def get_reminder_status(user_id: int):
-    rows = supabase_get("subscription_reminders", {"user_id": f"eq.{user_id}"})
-    if rows:
-        return rows[0]
-    return None
-
-
-def set_reminder_sent(user_id: int, reminder_type: str):
-    data = {reminder_type: True}
-    existing = get_reminder_status(user_id)
-    if existing:
-        return supabase_patch("subscription_reminders", {"user_id": user_id}, data)
-    else:
-        return supabase_post("subscription_reminders", {"user_id": user_id, reminder_type: True})
-
-
-def reset_reminders(user_id: int):
-    data = {"remind_12h_sent": False, "remind_1d_sent": False, "remind_3d_sent": False}
-    existing = get_reminder_status(user_id)
-    if existing:
-        return supabase_patch("subscription_reminders", {"user_id": user_id}, data)
-    else:
-        return supabase_post("subscription_reminders", {"user_id": user_id, **data})
-
-
 # ---------- Административные функции ----------
 
 def get_stats() -> dict:
-    """Возвращает статистику по пользователям и подпискам."""
+    """Возвращает счётчик пользователей бота."""
     rows = supabase_get("users", {}) or []
-    now = datetime.now(timezone.utc)
-    active = expired = no_sub = 0
-    for u in rows:
-        expire = u.get("subscription_expire")
-        if not expire:
-            no_sub += 1
-            continue
-        try:
-            dt = datetime.fromisoformat(expire.replace("Z", "+00:00"))
-            if dt > now:
-                active += 1
-            else:
-                expired += 1
-        except ValueError:
-            no_sub += 1
-    return {"total": len(rows), "active": active, "expired": expired, "no_sub": no_sub}
+    return {"total": len(rows)}
 
 
 def get_all_telegram_ids() -> list:
@@ -214,38 +128,62 @@ def get_all_telegram_ids() -> list:
     return [r["telegram_id"] for r in rows if r.get("telegram_id")]
 
 
-def revoke_subscription(telegram_id: int):
-    """Отзывает подписку пользователя (устанавливает expire = сейчас)."""
-    now = datetime.now(timezone.utc)
-    return supabase_patch("users", {"telegram_id": telegram_id},
-                          {"subscription_expire": now.isoformat()})
+# ---------- Удалённое управление: стоп-кран + арбитраж ----------
+
+def get_tools_admin() -> list:
+    """Список инструментов со статусом магазина и флагом стоп-крана."""
+    rows = supabase_get("tools", {"select": "slug,name,status,enabled",
+                                  "order": "sort_order.asc"})
+    return rows or []
 
 
-# ---------- Новая функция для получения пользователей с истекающей подпиской ----------
-def get_users_with_expiring_subscription():
-    """
-    Возвращает список пользователей, у которых подписка истекает в ближайшие 3 дня.
-    Каждый элемент: {'telegram_id': int, 'days_left': float}
-    """
-    now = datetime.now(timezone.utc)
-    # Получаем всех пользователей, у которых есть subscription_expire
-    rows = supabase_get("users", {"subscription_expire": "not.is.null"})
-    if not rows:
-        return []
-    result = []
-    for user in rows:
-        telegram_id = user.get("telegram_id")
-        expire_str = user.get("subscription_expire")
-        if not telegram_id or not expire_str:
-            continue
-        try:
-            expire_dt = datetime.fromisoformat(expire_str.replace("Z", "+00:00"))
-        except ValueError:
-            logger.warning("Пропущена некорректная дата подписки user %s: %s", telegram_id, expire_str)
-            continue
-        time_left = expire_dt - now
-        days_left = time_left.total_seconds() / 3600 / 24
-        # Отбираем тех, у кого осталось от 0 до 3 дней (но не больше 3)
-        if 0 < days_left <= 3:
-            result.append({'telegram_id': telegram_id, 'days_left': days_left})
-    return result
+def set_tool_field(slug: str, field: str, value) -> bool:
+    """PATCH одного поля tools по slug. Разрешены только безопасные поля."""
+    if field not in ("enabled", "status", "disabled_message"):
+        return False
+    resp = supabase_patch("tools", {"slug": slug}, {field: value})
+    return bool(resp and resp.ok)
+
+
+def stop_tool(slug: str, message: str | None) -> bool:
+    """Стоп-кран: enabled=false (+ сообщение для стоп-экрана)."""
+    data = {"enabled": False}
+    if message:
+        data["disabled_message"] = message
+    resp = supabase_patch("tools", {"slug": slug}, data)
+    return bool(resp and resp.ok)
+
+
+def get_open_disputes() -> list:
+    """Спорные сделки биржи (для арбитража)."""
+    rows = supabase_get("tasks_deals", {
+        "status": "eq.disputed",
+        "select": "id,amount,fee,task_id,customer_id,executor_id,held_at",
+        "order": "held_at.desc.nullslast"})
+    return rows or []
+
+
+def resolve_dispute(deal_id: str, decision: str, reason: str) -> tuple[bool, str]:
+    """Арбитраж через Edge tasks-robokassa-resolve (x-admin-secret + service_role)."""
+    import requests
+    from vacantrix.telegram.config import (
+        FUNCTIONS_URL, ADMIN_SECRET, SUPABASE_SERVICE_KEY,
+    )
+    if not ADMIN_SECRET:
+        return False, "ADMIN_SECRET не задан в окружении бота — арбитраж недоступен"
+    try:
+        r = requests.post(
+            f"{FUNCTIONS_URL}/tasks-robokassa-resolve",
+            json={"deal_id": deal_id, "decision": decision, "reason": reason},
+            headers={"x-admin-secret": ADMIN_SECRET,
+                     "apikey": SUPABASE_SERVICE_KEY,
+                     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                     "Content-Type": "application/json"},
+            timeout=30)
+        if r.ok:
+            return True, "готово"
+        if r.status_code == 404:
+            return False, "Edge-функция не задеплоена (контур Robokassa ещё не готов)"
+        return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    except requests.RequestException as exc:
+        return False, str(exc)

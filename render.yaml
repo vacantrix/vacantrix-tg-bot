@@ -7,15 +7,16 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: PROVIDER_TOKEN
-        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
         sync: false
-      - key: ADMIN_ID
+      # service_role-ключ: бот — доверенный бэкенд, серверные операции с users
+      # идут под ним (обходит RLS). ОБЯЗАТЕЛЕН после применения
+      # migrations/migrate_lock_bot_tables.py.
+      - key: SUPABASE_SERVICE_KEY
         sync: false
-      - key: VERSIONS_GROUP_ID
+      - key: ADMIN_ID
         sync: false
       - key: INSTRUCTION_URL
         sync: false
