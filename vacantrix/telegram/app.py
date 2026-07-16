@@ -34,12 +34,13 @@ from vacantrix.telegram.config import (
     BOT_TOKEN, WEBHOOK_URL, WEBHOOK_SECRET, TICK_KEY, PORT, MAX_BOT_TOKEN,
 )
 from vacantrix.telegram.handlers import (
-    start, menu_command, notifications_command,
+    start, menu_command, notifications_command, subscription_command,
     stats_command, broadcast_command, find_user,
     apps_command, stop_command, unstop_command, hide_command, show_command,
     button_handler, handle_text,
 )
 from vacantrix.telegram import supabase as sb
+from vacantrix.telegram import texts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,18 +57,45 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         try:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text="⚠️ Произошла ошибка. Попробуйте /menu.",
+                text=texts.ERROR,
             )
         except Exception:
             pass
 
 
 async def post_init(application: Application) -> None:
-    await application.bot.set_my_commands([
-        BotCommand("start",         "Запустить бота"),
-        BotCommand("menu",          "Главное меню"),
-        BotCommand("notifications", "Уведомления: статус и подключение"),
-    ])
+    """Профиль бота (BotFather) целиком из кода — версионируется в texts.py.
+
+    Каждый параметр ставится ТОЛЬКО при отличии от текущего (getMy* → сравнение):
+    setMyName у Telegram жёстко рейт-лимитирован, лишние вызовы съедят лимит.
+    Ошибки не роняют старт — недоехавшее доедет на следующем рестарте."""
+    bot = application.bot
+    try:
+        await bot.set_my_commands(
+            [BotCommand(cmd, desc) for cmd, desc in texts.BOT_COMMANDS])
+    except Exception as exc:
+        logger.warning("post_init: set_my_commands: %s", exc)
+    try:
+        cur = await bot.get_my_short_description()
+        if (cur.short_description or "") != texts.BOT_SHORT_DESCRIPTION:
+            await bot.set_my_short_description(texts.BOT_SHORT_DESCRIPTION)
+            logger.info("post_init: обновлено короткое описание бота")
+    except Exception as exc:
+        logger.warning("post_init: short_description: %s", exc)
+    try:
+        cur = await bot.get_my_description()
+        if (cur.description or "") != texts.BOT_DESCRIPTION:
+            await bot.set_my_description(texts.BOT_DESCRIPTION)
+            logger.info("post_init: обновлено описание бота")
+    except Exception as exc:
+        logger.warning("post_init: description: %s", exc)
+    try:
+        cur = await bot.get_my_name()
+        if (cur.name or "") != texts.BOT_NAME:
+            await bot.set_my_name(texts.BOT_NAME)
+            logger.info("post_init: обновлено имя бота")
+    except Exception as exc:
+        logger.warning("post_init: name: %s", exc)
 
 
 def build_application(webhook: bool) -> Application:
@@ -80,6 +108,7 @@ def build_application(webhook: bool) -> Application:
     app.add_handler(CommandHandler("start",         start))
     app.add_handler(CommandHandler("menu",          menu_command))
     app.add_handler(CommandHandler("notifications", notifications_command))
+    app.add_handler(CommandHandler("subscription",  subscription_command))
 
     # Администраторские команды
     app.add_handler(CommandHandler("stats",     stats_command))
@@ -172,6 +201,8 @@ def _build_asgi(ptb: Application):
             chat_id = ch.get("telegram_chat_id")
             if not chat_id:
                 out["telegram"] = "not_linked"
+            elif ch.get("telegram_muted"):
+                out["telegram"] = "muted"       # пауза из бота: видим, но молчим
             else:
                 try:
                     await ptb.bot.send_message(
@@ -271,6 +302,15 @@ async def _run_polling_gateway(ptb: Application) -> None:
 
 
 def main() -> None:
+    # Анти-зомби: боевой бот живёт на Amvera. Старый Render-сервис автодеплоится
+    # с GitHub и, поднявшись в polling, дерётся за getUpdates (Conflict 409).
+    # Render сам ставит env RENDER → отказываемся стартовать (явный override —
+    # VX_ALLOW_RENDER=1, если когда-нибудь осознанно вернёмся на Render).
+    if os.getenv("RENDER") and not os.getenv("VX_ALLOW_RENDER"):
+        raise RuntimeError(
+            "Этот сервис выведен из эксплуатации: бот работает на Amvera. "
+            "Удалите Render-сервис или задайте VX_ALLOW_RENDER=1.")
+
     if os.getenv("VX_USE_WEBHOOK") and WEBHOOK_URL:
         if not WEBHOOK_SECRET or not TICK_KEY:
             raise RuntimeError("В webhook-режиме обязательны WEBHOOK_SECRET и TICK_KEY")

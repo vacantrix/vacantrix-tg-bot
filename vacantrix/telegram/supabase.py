@@ -90,19 +90,93 @@ def redeem_link_code(code: str, telegram_chat_id: int, channel: str = "telegram"
 
 
 def get_link_by_chat(telegram_chat_id: int):
-    """Обратный поиск линковки: чей это Telegram-чат. None — не привязан."""
+    """Обратный поиск линковки: чей это Telegram-чат. None — не привязан.
+
+    select=* — терпимо к отсутствию колонки telegram_muted до миграции."""
     rows = supabase_get("notify_channels", {
-        "telegram_chat_id": f"eq.{telegram_chat_id}",
-        "select": "user_id,telegram_linked_at"})
+        "telegram_chat_id": f"eq.{telegram_chat_id}", "select": "*"})
     return rows[0] if rows else None
 
 
 def get_channels_for_user(user_id: str):
     """Каналы доставки пользователя (для /notify). None — не привязан."""
     rows = supabase_get("notify_channels", {
-        "user_id": f"eq.{user_id}",
-        "select": "telegram_chat_id,max_user_id"})
+        "user_id": f"eq.{user_id}", "select": "*"})
     return rows[0] if rows else None
+
+
+def set_telegram_muted(user_id: str, muted: bool) -> bool:
+    """Пауза/возобновление Telegram-уведомлений (chat_id НЕ трогаем — это пауза,
+    не отвязка; клиентский notify_unlink NULL-ит chat_id, мы — нет)."""
+    resp = supabase_patch("notify_channels", {"user_id": user_id}, {
+        "telegram_muted": muted,
+        "updated_at": datetime.now(timezone.utc).isoformat()})
+    return bool(resp and resp.ok)
+
+
+# ---------- Витрина «пульта»: подписка, лимиты, каталог, новости ----------
+
+def _month_key() -> str:
+    """Ключ месяца freemium-счётчиков — 'YYYY-MM' в UTC (как в RPC hh/avito)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def get_active_subscriptions(user_id: str) -> list | None:
+    """Активные подписки пользователя (+имена инструмента/плана embed'ом).
+    [] — подписок нет, None — сервер недоступен."""
+    now = datetime.now(timezone.utc).isoformat()
+    return supabase_get("subscriptions", {
+        "user_id": f"eq.{user_id}", "status": "eq.active",
+        "expires_at": f"gt.{now}",
+        "select": "expires_at,tools(slug,name),plans(name)",
+        "order": "expires_at.desc"})
+
+
+def get_profile(user_id: str):
+    """Кросс-проектный профиль vx_profiles (display_name, avito_user_id…)."""
+    rows = supabase_get("vx_profiles", {
+        "web_user_id": f"eq.{user_id}",
+        "select": "display_name,avito_user_id,subscription_expire"})
+    return rows[0] if rows else None
+
+
+def get_hh_free_used(user_id: str) -> int | None:
+    """Расход freemium HH за текущий месяц (ключ v2 = platform-uuid как text).
+    0 — расхода не было, None — сервер недоступен."""
+    rows = supabase_get("hh_free_usage", {
+        "applicant_id": f"eq.{user_id}", "month": f"eq.{_month_key()}",
+        "select": "used"})
+    if rows is None:
+        return None
+    return int(rows[0].get("used") or 0) if rows else 0
+
+
+def get_avito_free_used(user_id: str) -> int | None:
+    """Расход freemium Avito за текущий месяц.
+
+    Ключ v2 (migrate_avito_free_limit_v2, фикс O1) — platform-uuid как text
+    в колонке avito_user_id (как у HH; старые строки по реальному avito-id инертны)."""
+    rows = supabase_get("avito_free_usage", {
+        "avito_user_id": f"eq.{user_id}", "month": f"eq.{_month_key()}",
+        "select": "used"})
+    if rows is None:
+        return None
+    return int(rows[0].get("used") or 0) if rows else 0
+
+
+def get_tools_catalog() -> list | None:
+    """Живой каталог инструментов для витрины (active/coming_soon).
+    select=* — терпимо к составу колонок (tagline может отсутствовать)."""
+    return supabase_get("tools", {
+        "status": "in.(active,coming_soon)",
+        "order": "sort_order.asc", "select": "*"})
+
+
+def get_news(limit: int = 5) -> list | None:
+    """Последние опубликованные новости сайта (web_news)."""
+    return supabase_get("web_news", {
+        "published": "eq.true", "order": "published_at.desc",
+        "limit": str(limit), "select": "*"})
 
 
 def get_user_id_from_jwt(jwt: str):
