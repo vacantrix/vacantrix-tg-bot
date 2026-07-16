@@ -1,12 +1,13 @@
 # vacantrix/telegram/supabase.py
-"""Функции работы с Supabase (пользователи бота — только чтение подписки как справка)."""
+"""Работа с Supabase (self-host): пользователи бота, линковка уведомлений,
+стоп-кран инструментов, очередь push-уведомлений экосистемы."""
 
 import logging
 from datetime import datetime, timezone
 
 import requests
 
-from vacantrix.telegram.config import SUPABASE_URL, HEADERS
+from vacantrix.telegram.config import SUPABASE_URL, SUPABASE_KEY, HEADERS
 
 logger = logging.getLogger(__name__)
 
@@ -45,27 +46,18 @@ def supabase_patch(table, filters_dict, data):
     return _request("PATCH", table, params=params, json=data)
 
 
+# ---------- Пользователи бота ----------
+
 def get_user_by_telegram(telegram_id):
     rows = supabase_get("users", {"telegram_id": f"eq.{telegram_id}"})
     return rows[0] if rows else None
 
 
-def get_user_by_applicant(applicant_id):
-    rows = supabase_get("users", {"applicant_id": f"eq.{applicant_id}"})
-    return rows[0] if rows else None
+def create_user(telegram_id):
+    return supabase_post("users", {"telegram_id": telegram_id})
 
 
-def create_user(telegram_id, applicant_id=None):
-    data = {"telegram_id": telegram_id}
-    if applicant_id:
-        data["applicant_id"] = applicant_id
-    return supabase_post("users", data)
-
-
-def link_applicant(telegram_id, applicant_id):
-    return supabase_patch("users", {"telegram_id": telegram_id},
-                          {"applicant_id": applicant_id})
-
+# ---------- Линковка уведомлений (notify_link_codes / notify_channels) ----------
 
 def redeem_link_code(code: str, telegram_chat_id: int, channel: str = "telegram"):
     """Погасить одноразовый код линковки и записать chat_id в notify_channels.
@@ -97,21 +89,63 @@ def redeem_link_code(code: str, telegram_chat_id: int, channel: str = "telegram"
     return uid
 
 
-def check_subscription_status(profile):
-    if not profile:
-        return "❌ Не активна"
-    expire = profile.get("subscription_expire")
-    if not expire:
-        return "❌ Не активна"
+def get_link_by_chat(telegram_chat_id: int):
+    """Обратный поиск линковки: чей это Telegram-чат. None — не привязан."""
+    rows = supabase_get("notify_channels", {
+        "telegram_chat_id": f"eq.{telegram_chat_id}",
+        "select": "user_id,telegram_linked_at"})
+    return rows[0] if rows else None
+
+
+def get_channels_for_user(user_id: str):
+    """Каналы доставки пользователя (для /notify). None — не привязан."""
+    rows = supabase_get("notify_channels", {
+        "user_id": f"eq.{user_id}",
+        "select": "telegram_chat_id,max_user_id"})
+    return rows[0] if rows else None
+
+
+def get_user_id_from_jwt(jwt: str):
+    """Валидация пользовательского JWT через GoTrue (как auth.getUser() в Edge).
+
+    Возвращает user_id или None. Ходит под anon-apikey + Bearer=JWT юзера —
+    подпись/срок проверяет сам GoTrue."""
+    if not jwt:
+        return None
     try:
-        expire_dt = datetime.fromisoformat(expire.replace("Z", "+00:00"))
+        r = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {jwt}"},
+            timeout=REQUEST_TIMEOUT)
+        if not r.ok:
+            return None
+        return (r.json() or {}).get("id")
+    except (requests.RequestException, ValueError) as exc:
+        logger.error("auth/v1/user error: %s", exc)
+        return None
+
+
+# ---------- Push-очередь экосистемы (platform_notifications → Telegram) ----------
+
+def fetch_pending_pushes(limit: int = 50) -> list:
+    """Недоставленные ЛИЧНЫЕ уведомления платформы для привязанных юзеров.
+
+    RPC tg_pending_pushes (self-host, SECURITY DEFINER, только service_role):
+    anti-join c tg_push_log + join notify_channels."""
+    resp = _request("POST", "rpc/tg_pending_pushes", json={"p_limit": limit})
+    if not resp or not resp.ok:
+        return []
+    try:
+        return resp.json() or []
     except ValueError:
-        logger.warning("Некорректная дата подписки: %s", expire)
-        return "⚠️ Требует проверки"
-    if expire_dt > datetime.now(timezone.utc):
-        days_left = (expire_dt - datetime.now(timezone.utc)).days
-        return f"✅ Активна ({days_left} дн.)"
-    return "❌ Истекла"
+        return []
+
+
+def mark_pushed(notification_id: str) -> bool:
+    """Журнал доставки: уведомление отправлено (или чат мёртв — не ретраить)."""
+    resp = supabase_post("tg_push_log", {"notification_id": notification_id})
+    # 409 (дубль PK) тоже считаем успехом — уже журналировано.
+    return bool(resp is not None and (resp.ok or resp.status_code == 409))
 
 
 # ---------- Административные функции ----------
@@ -128,7 +162,7 @@ def get_all_telegram_ids() -> list:
     return [r["telegram_id"] for r in rows if r.get("telegram_id")]
 
 
-# ---------- Удалённое управление: стоп-кран + арбитраж ----------
+# ---------- Удалённое управление: стоп-кран инструментов ----------
 
 def get_tools_admin() -> list:
     """Список инструментов со статусом магазина и флагом стоп-крана."""
@@ -152,38 +186,3 @@ def stop_tool(slug: str, message: str | None) -> bool:
         data["disabled_message"] = message
     resp = supabase_patch("tools", {"slug": slug}, data)
     return bool(resp and resp.ok)
-
-
-def get_open_disputes() -> list:
-    """Спорные сделки биржи (для арбитража)."""
-    rows = supabase_get("tasks_deals", {
-        "status": "eq.disputed",
-        "select": "id,amount,fee,task_id,customer_id,executor_id,held_at",
-        "order": "held_at.desc.nullslast"})
-    return rows or []
-
-
-def resolve_dispute(deal_id: str, decision: str, reason: str) -> tuple[bool, str]:
-    """Арбитраж через Edge tasks-robokassa-resolve (x-admin-secret + service_role)."""
-    import requests
-    from vacantrix.telegram.config import (
-        FUNCTIONS_URL, ADMIN_SECRET, SUPABASE_SERVICE_KEY,
-    )
-    if not ADMIN_SECRET:
-        return False, "ADMIN_SECRET не задан в окружении бота — арбитраж недоступен"
-    try:
-        r = requests.post(
-            f"{FUNCTIONS_URL}/tasks-robokassa-resolve",
-            json={"deal_id": deal_id, "decision": decision, "reason": reason},
-            headers={"x-admin-secret": ADMIN_SECRET,
-                     "apikey": SUPABASE_SERVICE_KEY,
-                     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                     "Content-Type": "application/json"},
-            timeout=30)
-        if r.ok:
-            return True, "готово"
-        if r.status_code == 404:
-            return False, "Edge-функция не задеплоена (контур Robokassa ещё не готов)"
-        return False, f"HTTP {r.status_code}: {r.text[:200]}"
-    except requests.RequestException as exc:
-        return False, str(exc)

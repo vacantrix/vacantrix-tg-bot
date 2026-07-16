@@ -1,21 +1,18 @@
 # vacantrix/telegram/handlers.py
-"""Обработчики команд и кнопок Telegram-бота."""
+"""Обработчики команд и кнопок Telegram-бота (шлюз экосистемы Vacantrix)."""
 
 import time
 import logging
-from datetime import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from vacantrix.telegram.config import (
-    ADMIN_ID, INSTRUCTION_URL, SUPPORT_URL, FAQ_URL,
-    HH_DOWNLOAD_URL, PLATFORM_DOWNLOAD_URL, SITE_URL,
+    ADMIN_ID, INSTRUCTION_URL, SUPPORT_URL, FAQ_URL, SITE_URL,
 )
 from vacantrix.telegram.supabase import (
-    get_user_by_telegram, get_user_by_applicant,
-    create_user, link_applicant,
-    check_subscription_status, get_stats, get_all_telegram_ids,
+    get_user_by_telegram, create_user, get_link_by_chat,
+    get_stats, get_all_telegram_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,16 +31,6 @@ def _check_rate(user_id: int) -> bool:
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
-def _fmt_date(iso_str: str | None) -> str:
-    if not iso_str:
-        return "—"
-    try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return dt.strftime("%d.%m.%Y %H:%M UTC")
-    except ValueError:
-        return iso_str
-
-
 def _is_private(update: Update) -> bool:
     return update.effective_chat.type == "private"
 
@@ -56,21 +43,20 @@ def _is_admin(update: Update) -> bool:
 
 MAIN_MENU_TEXT = (
     "👋 Привет, {name}!\n\n"
-    "Это бот Vacantrix — скачивание приложений, инструкции и поддержка.\n"
-    "Подписки оформляются в приложении Vacantrix Platform.\n\n"
-    "Выберите нужный раздел:"
+    "Это бот экосистемы Vacantrix. Сюда приходят уведомления ваших приложений: "
+    "результаты мониторингов, оплата, продление подписки, новые версии.\n\n"
+    "Выберите раздел:"
 )
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Скачать приложение",       callback_data="download_latest")],
-        [InlineKeyboardButton("📖 Инструкция",               callback_data="instructions")],
-        [InlineKeyboardButton("📊 Мой профиль",              callback_data="profile")],
-        [InlineKeyboardButton("🔗 Привязать ID соискателя",  callback_data="link")],
-        [InlineKeyboardButton("🛠 Поддержка",                callback_data="support")],
-        [InlineKeyboardButton("❓ FAQ",                      callback_data="faq")],
-        [InlineKeyboardButton("ℹ️ О боте",                   callback_data="about")],
+        [InlineKeyboardButton("🔔 Уведомления",         callback_data="notifications")],
+        [InlineKeyboardButton("📥 Скачать приложение",  callback_data="download_latest")],
+        [InlineKeyboardButton("📖 Инструкция",          callback_data="instructions")],
+        [InlineKeyboardButton("❓ FAQ",                 callback_data="faq")],
+        [InlineKeyboardButton("🛠 Поддержка",           callback_data="support")],
+        [InlineKeyboardButton("ℹ️ О боте",              callback_data="about")],
     ])
 
 
@@ -109,8 +95,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if redeem_link_code(args[0].strip(), user.id, "telegram"):
             await update.message.reply_text(
                 "✅ Telegram подключён к Vacantrix.\n\n"
-                "Сюда будут приходить уведомления по вашим мониторингам "
-                "(новые объявления Авито и вакансии). Отключить — в приложении.")
+                "Сюда будут приходить уведомления ваших приложений: результаты "
+                "мониторингов (Авито и вакансии), оплата, продление подписки, "
+                "новые версии. Отключить — в приложении.")
             return
         await update.message.reply_text(
             "⚠️ Ссылка подключения недействительна или уже использована.\n"
@@ -137,31 +124,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     msg = await send_main_menu(update.message, user.first_name)
     context.user_data["last_bot_message"] = msg
-    context.user_data.pop("awaiting_applicant_id", None)
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_private(update):
         return
-    context.user_data.pop("awaiting_applicant_id", None)
     await send_main_menu(update.message, update.effective_user.first_name)
 
 
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сбрасывает любое ожидающее состояние."""
+async def notifications_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_private(update):
         return
-    context.user_data.pop("awaiting_applicant_id", None)
-    await update.message.reply_text(
-        "Действие отменено. Открываю главное меню.",
-        reply_markup=main_menu_keyboard(),
-    )
-
-
-async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_private(update):
-        return
-    await _send_profile(update.message, update.effective_user)
+    await _send_notifications_status(update.message, update.effective_chat.id)
 
 
 # ── Админ-команды ─────────────────────────────────────────────────────────────
@@ -179,13 +153,19 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/broadcast <текст> — СЕРВИСНАЯ рассылка всем пользователям бота.
+
+    ⚠️ Только сервисные/транзакционные сообщения. Рекламные рассылки требуют
+    согласия на рекламу с каналом «Telegram» (38-ФЗ ст. 18) — их через эту
+    команду не отправлять, пока Согласие №2 не покрывает Telegram."""
     if not _is_private(update) or not _is_admin(update):
         await update.message.reply_text("⛔ Нет прав.")
         return
     if not context.args:
         await update.message.reply_text(
             "Использование: /broadcast <текст>\n"
-            "Текст будет отправлен всем пользователям бота."
+            "Текст будет отправлен всем пользователям бота.\n"
+            "⚠️ Только сервисные сообщения (не реклама)."
         )
         return
     text = " ".join(context.args)
@@ -210,34 +190,27 @@ async def find_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = context.args or []
     if not args:
-        await update.message.reply_text(
-            "Использование: /find_user <telegram_id или applicant_id>"
-        )
+        await update.message.reply_text("Использование: /find_user <telegram_id>")
         return
-    query_val = args[0]
-    profile = None
     try:
-        profile = get_user_by_telegram(int(query_val))
+        tg_id = int(args[0])
     except ValueError:
-        pass
-    if not profile:
-        profile = get_user_by_applicant(query_val)
+        await update.message.reply_text("❌ telegram_id должен быть числом.")
+        return
+    profile = get_user_by_telegram(tg_id)
     if not profile:
         await update.message.reply_text("❌ Пользователь не найден.")
         return
-
-    status = check_subscription_status(profile)
+    link = get_link_by_chat(tg_id)
     await update.message.reply_text(
         f"👤 *Пользователь*\n\n"
         f"Telegram ID: `{profile.get('telegram_id')}`\n"
-        f"Applicant ID: `{profile.get('applicant_id') or '—'}`\n"
-        f"Подписка: {status}\n"
-        f"Истекает: {_fmt_date(profile.get('subscription_expire'))}",
+        f"Уведомления: {'🔔 подключены' if link else '🔕 не подключены'}",
         parse_mode="Markdown",
     )
 
 
-# ── Удалённое управление: стоп-кран + арбитраж ────────────────────────────────
+# ── Удалённое управление: стоп-кран ───────────────────────────────────────────
 
 _STORE_ICON = {"active": "🟢", "coming_soon": "🟡", "hidden": "🔴"}
 
@@ -259,7 +232,7 @@ async def apps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         lines.append(f"{store} `{t['slug']}` — магазин: {t.get('status')}, "
                      f"у пользователей: {users}")
     lines.append("\n/stop <slug> [причина] · /unstop <slug>\n"
-                 "/hide <slug> · /show <slug> · /disputes")
+                 "/hide <slug> · /show <slug>")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -332,73 +305,55 @@ async def show_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"{'✅' if ok else '❌'} `{args[0]}` снова в магазине.", parse_mode="Markdown")
 
 
-async def disputes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/disputes — спорные сделки; /resolve для решения."""
-    if not _is_private(update) or not _is_admin(update):
-        await update.message.reply_text("⛔ Нет прав.")
-        return
-    from vacantrix.telegram.supabase import get_open_disputes
-    deals = get_open_disputes()
-    if not deals:
-        await update.message.reply_text("✅ Открытых споров нет.")
-        return
-    lines = ["⚖️ *Споры на арбитраж*\n"]
-    for d in deals[:20]:
-        lines.append(f"`{d['id']}`\n  сумма {d.get('amount')} ₽ · задача "
-                     f"{str(d.get('task_id'))[:8]}")
-    lines.append("\nРешение: /resolve <deal_id> <release|refund> <причина>")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+# ── Раздел «Уведомления» ──────────────────────────────────────────────────────
 
-
-async def resolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/resolve <deal_id> <release|refund> <причина> — арбитраж спора."""
-    if not _is_private(update) or not _is_admin(update):
-        await update.message.reply_text("⛔ Нет прав.")
-        return
-    args = context.args or []
-    if len(args) < 3 or args[1] not in ("release", "refund"):
-        await update.message.reply_text(
-            "Использование: /resolve <deal_id> <release|refund> <причина>\n"
-            "release — деньги исполнителю, refund — заказчику.")
-        return
-    deal_id, decision, reason = args[0], args[1], " ".join(args[2:])
-    from vacantrix.telegram.supabase import resolve_dispute
-    ok, note = resolve_dispute(deal_id, decision, reason)
-    await update.message.reply_text(
-        f"{'✅ Арбитраж выполнен' if ok else '❌ Не удалось'}: {note}")
+async def _send_notifications_status(message, chat_id: int) -> None:
+    link = get_link_by_chat(chat_id)
+    if link:
+        text = (
+            "🔔 *Уведомления*\n\n"
+            "✅ Telegram подключён к вашему аккаунту Vacantrix.\n\n"
+            "Сюда приходят:\n"
+            "• результаты ваших мониторингов — новые объявления Авито и вакансии\n"
+            "• события платформы: оплата, продление подписки, новые версии\n\n"
+            "Отключить можно в приложении: Уведомления → «Отключить»."
+        )
+    else:
+        text = (
+            "🔔 *Уведомления*\n\n"
+            "Telegram пока не подключён к аккаунту Vacantrix.\n\n"
+            "Как подключить:\n"
+            "1. Откройте приложение Vacantrix (например, Monitor)\n"
+            "2. Раздел «Уведомления» → «Подключить Telegram»\n"
+            "3. Перейдите по ссылке из приложения — бот всё сделает сам\n\n"
+            "После подключения сюда будут приходить результаты мониторингов "
+            "и события платформы (оплата, подписка, новые версии)."
+        )
+    await message.reply_text(
+        text,
+        reply_markup=back_keyboard(
+            [InlineKeyboardButton("🌐 Скачать приложения", url=SITE_URL)],
+        ),
+        parse_mode="Markdown",
+    )
 
 
 # ── Обработчик кнопок ─────────────────────────────────────────────────────────
 
-async def _cb_profile(query, context, user) -> None:
-    await _send_profile(query.message, user)
-
-
-async def _cb_link(query, context, user) -> None:
-    await query.message.reply_text(
-        "🔗 *Привязать ID соискателя*\n\n"
-        "Введите ID соискателя, который отображается в приложении Vacantrix.\n\n"
-        "Зачем это нужно:\n"
-        "• приложение проверяет подписку по этому ID\n"
-        "• один ID — один аккаунт\n\n"
-        "Чтобы отменить — введите /cancel.",
-        reply_markup=back_keyboard(),
-        parse_mode="Markdown",
-    )
-    context.user_data["awaiting_applicant_id"] = True
+async def _cb_notifications(query, context, user) -> None:
+    await _send_notifications_status(query.message, query.message.chat_id)
 
 
 async def _cb_download_latest(query, context, user) -> None:
     await query.message.reply_text(
         "📥 *Скачать приложение*\n\n"
-        "Прямые ссылки на последние версии:\n"
+        "Все приложения экосистемы — на сайте Vacantrix:\n"
+        "• *Vacantrix Platform* — установщик всех инструментов\n"
         "• *Vacantrix* — автоотклики на hh.ru\n"
-        "• *Vacantrix Platform* — установщик всех инструментов экосистемы\n\n"
+        "• *Monitor, Analytics, Publisher* и другие\n\n"
         "Подписки оформляются в приложении Vacantrix Platform.",
         reply_markup=back_keyboard(
-            [InlineKeyboardButton("🤖 Vacantrix (HH-бот)", url=HH_DOWNLOAD_URL)],
-            [InlineKeyboardButton("🚀 Vacantrix Platform", url=PLATFORM_DOWNLOAD_URL)],
-            [InlineKeyboardButton("🌐 Сайт Vacantrix", url=SITE_URL)],
+            [InlineKeyboardButton("🌐 Скачать на сайте", url=SITE_URL)],
             [InlineKeyboardButton("📖 Инструкция", url=INSTRUCTION_URL)],
         ),
         parse_mode="Markdown",
@@ -407,17 +362,17 @@ async def _cb_download_latest(query, context, user) -> None:
 
 async def _cb_instructions(query, context, user) -> None:
     await query.message.reply_text(
-        "📖 *Инструкция по настройке*\n\n"
-        "1\\. Скачайте приложение в разделе «Скачать приложение»\n"
-        "2\\. Запустите Vacantrix и авторизуйтесь в hh\\.ru\n"
-        "3\\. Скопируйте ID соискателя из приложения\n"
-        "4\\. Вернитесь сюда → «Привязать ID соискателя»\n"
-        "5\\. Подписка оформляется в приложении Vacantrix Platform\n\n"
-        "Подробная инструкция по кнопке ниже\\.",
+        "📖 *Как начать*\n\n"
+        "1. Скачайте установщик Vacantrix Platform на сайте\n"
+        "2. Войдите или создайте аккаунт — он один на все приложения\n"
+        "3. Установите нужный инструмент из каталога\n"
+        "4. В приложении подключите Telegram-уведомления "
+        "(Уведомления → «Подключить Telegram»)\n\n"
+        "Подробная инструкция по кнопке ниже.",
         reply_markup=back_keyboard(
             [InlineKeyboardButton("📖 Открыть инструкцию", url=INSTRUCTION_URL)],
         ),
-        parse_mode="MarkdownV2",
+        parse_mode="Markdown",
     )
 
 
@@ -425,14 +380,14 @@ async def _cb_support(query, context, user) -> None:
     await query.message.reply_text(
         "🛠 *Поддержка*\n\n"
         "Обращайтесь, если:\n"
+        "• не приходят уведомления\n"
         "• приложение не видит активную подписку\n"
-        "• не удаётся войти в hh\\.ru\n"
         "• нужна помощь с установкой\n\n"
-        "Подготовьте Telegram ID и ID соискателя из раздела «Мой профиль»\\.",
+        "Укажите email вашего аккаунта Vacantrix — так мы найдём вас быстрее.",
         reply_markup=back_keyboard(
             [InlineKeyboardButton("🔗 Написать в поддержку", url=SUPPORT_URL)],
         ),
-        parse_mode="MarkdownV2",
+        parse_mode="Markdown",
     )
 
 
@@ -440,13 +395,13 @@ async def _cb_faq(query, context, user) -> None:
     await query.message.reply_text(
         "❓ *Часто задаваемые вопросы*\n\n"
         "*Где оформить подписку?*\n"
-        "В приложении Vacantrix Platform. Установщик — в разделе «Скачать приложение».\n\n"
-        "*Зачем нужен ID соискателя?*\n"
-        "По нему приложение проверяет, что у вас есть активная подписка.\n\n"
+        "В приложении Vacantrix Platform. Установщик — на сайте vacantrix.ru.\n\n"
+        "*Как получать уведомления в Telegram?*\n"
+        "В приложении: Уведомления → «Подключить Telegram» → перейти по ссылке.\n\n"
         "*Почему приложение просит войти заново?*\n"
-        "Сессия hh.ru истекает. Нажмите «Обновить сессию» в приложении.\n\n"
+        "Сессия площадки (hh.ru и т.п.) истекает — нажмите «Обновить сессию».\n\n"
         "*Где скачать новую версию?*\n"
-        "В разделе «Скачать приложение».",
+        "На сайте vacantrix.ru — приложения сами подскажут об обновлении.",
         reply_markup=back_keyboard(
             [InlineKeyboardButton("🔗 Полный FAQ", url=FAQ_URL)],
         ),
@@ -457,12 +412,12 @@ async def _cb_faq(query, context, user) -> None:
 async def _cb_about(query, context, user) -> None:
     await query.message.reply_text(
         "ℹ️ *О боте Vacantrix*\n\n"
-        "Приложение Vacantrix автоматизирует отклики на вакансии hh.ru. "
-        "Этот бот — информационный помощник экосистемы Vacantrix.\n\n"
+        "Это шлюз уведомлений экосистемы Vacantrix — инструментов для поиска "
+        "работы и продвижения (автоотклики hh.ru/Авито, мониторинг объявлений, "
+        "аналитика, кросс-постинг).\n\n"
         "Возможности:\n"
-        "• Скачивание приложений (HH-бот, Vacantrix Platform)\n"
-        "• Инструкции и FAQ\n"
-        "• Справка о статусе подписки\n\n"
+        "• уведомления приложений прямо в Telegram\n"
+        "• скачивание приложений, инструкции, поддержка\n\n"
         "Подписки оформляются в приложении Vacantrix Platform.",
         reply_markup=back_keyboard(),
         parse_mode="Markdown",
@@ -475,18 +430,29 @@ async def _cb_legacy_payment(query, context, user) -> None:
         "💳 Бот больше не продаёт подписки.\n\n"
         "Подписки теперь оформляются в приложении Vacantrix Platform.",
         reply_markup=back_keyboard(
-            [InlineKeyboardButton("🚀 Скачать Vacantrix Platform", url=PLATFORM_DOWNLOAD_URL)],
+            [InlineKeyboardButton("🌐 Скачать на сайте", url=SITE_URL)],
         ),
+    )
+
+
+async def _cb_legacy_link(query, context, user) -> None:
+    """Кнопка «Привязать ID соискателя» из старых сообщений — привязка больше не нужна."""
+    await query.message.reply_text(
+        "🔗 Привязка ID соискателя больше не нужна.\n\n"
+        "Подписка проверяется автоматически через ваш аккаунт Vacantrix Platform.",
+        reply_markup=back_keyboard(),
     )
 
 
 # Устаревшие платёжные callback-и (кнопки в старых сообщениях)
 _LEGACY_PAYMENT_CB = {"buy", "referral", "payment_history", "back_to_subscription"}
 
-# Диспетчер callback-кнопок
+# Диспетчер callback-кнопок. «profile»/«link» — кнопки из СТАРЫХ сообщений:
+# profile теперь ведёт в «Уведомления», link — объясняет, что привязка не нужна.
 _CB_DISPATCH = {
-    "profile":         _cb_profile,
-    "link":            _cb_link,
+    "notifications":   _cb_notifications,
+    "profile":         _cb_notifications,
+    "link":            _cb_legacy_link,
     "download_latest": _cb_download_latest,
     "instructions":    _cb_instructions,
     "support":         _cb_support,
@@ -530,72 +496,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_private(update):
         return
-    if not context.user_data.get("awaiting_applicant_id"):
-        await update.message.reply_text(
-            "Используйте кнопки меню или команду /menu.",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    applicant_id = update.message.text.strip()
-    if not applicant_id or len(applicant_id) > 64:
-        await update.message.reply_text(
-            "❌ ID выглядит некорректно. Скопируйте его из приложения и отправьте ещё раз.",
-            reply_markup=back_keyboard(),
-        )
-        return
-
-    existing = get_user_by_applicant(applicant_id)
-    if existing and existing["telegram_id"] != update.effective_user.id:
-        await update.message.reply_text(
-            "❌ Этот ID соискателя уже привязан к другому аккаунту.",
-            reply_markup=back_keyboard(),
-        )
-        context.user_data["awaiting_applicant_id"] = False
-        return
-
-    resp = link_applicant(update.effective_user.id, applicant_id)
-    context.user_data["awaiting_applicant_id"] = False
-
-    if not resp or not resp.ok:
-        await update.message.reply_text(
-            "❌ Не удалось сохранить ID. Попробуйте позже или обратитесь в поддержку.",
-            reply_markup=back_keyboard([InlineKeyboardButton("🛠 Поддержка", url=SUPPORT_URL)]),
-        )
-        return
-
     await update.message.reply_text(
-        "✅ ID соискателя привязан.",
-        reply_markup=back_keyboard(
-            [InlineKeyboardButton("📊 Мой профиль", callback_data="profile")],
-        ),
-    )
-
-
-# ── Вспомогательный вывод профиля ────────────────────────────────────────────
-
-async def _send_profile(message, user) -> None:
-    profile = get_user_by_telegram(user.id)
-    if not profile:
-        await message.reply_text(
-            "Профиль не найден. Используйте /start.", reply_markup=back_keyboard()
-        )
-        return
-    status = check_subscription_status(profile)
-    expire = _fmt_date(profile.get("subscription_expire"))
-    text = (
-        "📊 *Мой профиль*\n\n"
-        f"Telegram ID: `{user.id}`\n"
-        f"ID соискателя: `{profile.get('applicant_id') or 'не привязан'}`\n"
-        f"Статус подписки: {status}\n"
-        f"Действует до: {expire}\n\n"
-        "Статус показан как справка. Подписки теперь оформляются "
-        "в приложении Vacantrix Platform."
-    )
-    await message.reply_text(
-        text,
-        reply_markup=back_keyboard(
-            [InlineKeyboardButton("🚀 Скачать Vacantrix Platform", url=PLATFORM_DOWNLOAD_URL)],
-        ),
-        parse_mode="Markdown",
+        "Используйте кнопки меню или команду /menu.",
+        reply_markup=main_menu_keyboard(),
     )

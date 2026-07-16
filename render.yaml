@@ -1,22 +1,35 @@
+# НАСТРОЙКИ СЕРВИСА НА RENDER (аккаунт VACANTRIX.official@).
+#
+# ⚠️ Blueprint-автодеплой работает только с привязанным GitHub/GitLab — у нас деплой
+# из ПУБЛИЧНОГО GitVerse-репо по URL, поэтому сервис создаётся ВРУЧНУЮ в дашборде
+# (New → Web Service → Public Git Repository → URL репо), а этот файл — документация
+# точных значений. Обновление кода = git push gitverse + кнопка Manual Deploy.
+#
+# Секреты вводятся в дашборде (Environment) — готовые значения в локальном .env.render
+# (gitignored, в репо НЕ попадает).
 services:
   - type: web
-    name: vacantrix-telegram-bot
-    env: python
+    name: vacantrix-tg-bot
+    runtime: python
+    plan: free                       # free web-сервис спит без входящих — webhook его будит
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
+    healthCheckPath: /healthz
     envVars:
-      - key: BOT_TOKEN
+      - key: BOT_TOKEN              # токен @Vacantrix_bot
         sync: false
-      - key: SUPABASE_URL
+      - key: SUPABASE_URL           # https://api.vacantrix.ru (self-host)
         sync: false
-      - key: SUPABASE_KEY
+      - key: SUPABASE_KEY           # legacy anon JWT (eyJ…), НЕ sb_publishable_
         sync: false
-      # service_role-ключ: бот — доверенный бэкенд, серверные операции с users
-      # идут под ним (обходит RLS). ОБЯЗАТЕЛЕН после применения
-      # migrations/migrate_lock_bot_tables.py.
-      - key: SUPABASE_SERVICE_KEY
+      - key: SUPABASE_SERVICE_KEY   # legacy service_role JWT
         sync: false
       - key: ADMIN_ID
         sync: false
+      - key: WEBHOOK_SECRET         # секрет Telegram-webhook (X-Telegram-Bot-Api-Secret-Token)
+        sync: false
+      - key: TICK_KEY               # ключ /tick (cron на ВМ)
+        sync: false
       - key: INSTRUCTION_URL
         sync: false
+# RENDER_EXTERNAL_URL и PORT Render задаёт автоматически — руками не вводить.

@@ -1,5 +1,11 @@
-# bot_config.py
-"""Конфигурация Telegram-бота Vacantrix (информационный бот — без оплаты)."""
+# vacantrix/telegram/config.py
+"""Конфигурация Telegram-бота Vacantrix — единого Telegram-шлюза экосистемы.
+
+Режимы:
+  • Render (прод): задан RENDER_EXTERNAL_URL (Render выставляет сам) или VX_WEBHOOK_URL →
+    webhook-режим (ASGI-сервер: /telegram, /notify, /tick, /healthz).
+  • Локальная разработка: URL не задан → обычный long-polling.
+"""
 
 import os
 from pathlib import Path
@@ -26,49 +32,45 @@ def _required_int_env(name: str) -> int:
 # --- Telegram Bot ---
 BOT_TOKEN = _required_env("BOT_TOKEN")
 
-# --- Supabase ---
+# --- Supabase (self-host, api.vacantrix.ru) ---
 SUPABASE_URL = _required_env("SUPABASE_URL")
-SUPABASE_KEY = _required_env("SUPABASE_KEY")          # publishable (anon)
+SUPABASE_KEY = _required_env("SUPABASE_KEY")          # legacy anon JWT (self-host Kong
+                                                      # НЕ принимает sb_publishable_…)
 
-# Бот — доверенный бэкенд (Render). Серверные операции с users идут под
-# service_role (обходит RLS) — таблица закрыта RLS для клиентских ролей.
-# На Render должна быть задана переменная SUPABASE_SERVICE_KEY.
+# Бот — доверенный бэкенд. Серверные операции (users, notify_*, tools, tg_push_log)
+# идут под service_role (обходит RLS).
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 if not SUPABASE_SERVICE_KEY:
     import sys as _sys
     print("[config] ВНИМАНИЕ: SUPABASE_SERVICE_KEY не задан — откат на anon-ключ. "
-          "После включения RLS на users операции бота сломаются!",
+          "Серверные операции бота под RLS сломаются!",
           file=_sys.stderr)
     SUPABASE_SERVICE_KEY = SUPABASE_KEY
 
 # --- Администратор ---
 ADMIN_ID = _required_int_env("ADMIN_ID")
 
-# --- Удалённое управление (стоп-кран + арбитраж) ---
-# FUNCTIONS_URL — для вызова Edge tasks-robokassa-resolve; ADMIN_SECRET — его гейт
-# (тот же секрет, что в env функции). Если не задан — /resolve honestly ответит,
-# что арбитраж недоступен.
-FUNCTIONS_URL = os.getenv("VX_FUNCTIONS_URL", f"{SUPABASE_URL}/functions/v1")
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+# --- Webhook-режим (Render) ---
+# RENDER_EXTERNAL_URL Render задаёт автоматически (https://<svc>.onrender.com);
+# VX_WEBHOOK_URL — ручной override (например, свой домен). Пусто → dev-polling.
+WEBHOOK_URL = (os.getenv("VX_WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+# Секрет Telegram-webhook (заголовок X-Telegram-Bot-Api-Secret-Token) и ключ /tick.
+# Обязательны в webhook-режиме — проверяется на старте в app.py.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+TICK_KEY = os.getenv("TICK_KEY", "")
+PORT = int(os.getenv("PORT", "10000"))
 
-# --- Инструкция пользователю ---
+# --- Доставка в MAX (опционально; тот же контракт, что у Edge notify-send) ---
+MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "")
+
+# --- Ссылки ---
 INSTRUCTION_URL = os.getenv("INSTRUCTION_URL", "https://t.me/VacantrixB_O_T/14")
 SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/VacantrixB_O_T/2")
 FAQ_URL = os.getenv("FAQ_URL", "https://t.me/VacantrixB_O_T/6")
+# Сайт — единый хаб загрузок (GitHub-раздача удалена 2026-07-16).
+SITE_URL = os.getenv("SITE_URL", "https://vacantrix.ru")
 
-# --- Прямые ссылки на скачивание (GitHub *-dist Releases) и сайт (GitHub Pages) ---
-# Откат с Яндекса на GitHub (2026-07-04): на self-host вернёмся перед запуском.
-HH_DOWNLOAD_URL = os.getenv(
-    "HH_DOWNLOAD_URL",
-    "https://github.com/vacantrix/vacantrix-hh-dist/releases/latest/download/Vacantrix.exe",
-)
-PLATFORM_DOWNLOAD_URL = os.getenv(
-    "PLATFORM_DOWNLOAD_URL",
-    "https://github.com/vacantrix/vacantrix-platform-dist/releases/latest/download/VacantrixSetup.exe",
-)
-SITE_URL = os.getenv("SITE_URL", "https://vacantrix.github.io/vacantrix-web/")
-
-# --- HTTP заголовки для Supabase ---
+# --- HTTP заголовки для Supabase (service_role) ---
 HEADERS = {
     "apikey": SUPABASE_SERVICE_KEY,
     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
