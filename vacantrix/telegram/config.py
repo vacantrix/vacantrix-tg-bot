@@ -53,7 +53,10 @@ ADMIN_ID = _required_int_env("ADMIN_ID")
 # --- Webhook-режим (Render) ---
 # RENDER_EXTERNAL_URL Render задаёт автоматически (https://<svc>.onrender.com);
 # VX_WEBHOOK_URL — ручной override (например, свой домен). Пусто → dev-polling.
-WEBHOOK_URL = (os.getenv("VX_WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+WEBHOOK_URL = (os.getenv("VX_WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+# Терпимо к вводу без схемы: Telegram-webhook обязан быть https — дописываем сами.
+if WEBHOOK_URL and not WEBHOOK_URL.startswith(("http://", "https://")):
+    WEBHOOK_URL = "https://" + WEBHOOK_URL
 # Секрет Telegram-webhook (заголовок X-Telegram-Bot-Api-Secret-Token) и ключ /tick.
 # Обязательны в webhook-режиме — проверяется на старте в app.py.
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
