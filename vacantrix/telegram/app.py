@@ -20,6 +20,7 @@ PTB `customwebhookbot`: апдейты кладутся в application.update_qu
 import asyncio
 import html as html_mod
 import logging
+import os
 
 import requests as _requests
 from telegram import BotCommand, Update
@@ -229,12 +230,13 @@ def _build_asgi(ptb: Application):
 
 
 async def _run_webhook(ptb: Application) -> None:
+    """Webhook-режим (VX_USE_WEBHOOK=1): Telegram шлёт апдейты на /telegram.
+    ⚠️ Не работает на РФ-хостинге (Amvera): Telegram не достучится ВХОДЯЩИМ до РФ-IP."""
     import uvicorn
 
     asgi = _build_asgi(ptb)
     server = uvicorn.Server(uvicorn.Config(
-        app=asgi, host="0.0.0.0", port=PORT, log_level="info"))
-
+        app=asgi, host="0.0.0.0", port=PORT, log_level="warning"))
     async with ptb:                                  # initialize (+post_init)
         await ptb.bot.set_webhook(
             url=f"{WEBHOOK_URL}/telegram",
@@ -243,21 +245,39 @@ async def _run_webhook(ptb: Application) -> None:
         )
         logger.info("Webhook установлен: %s/telegram", WEBHOOK_URL)
         await ptb.start()
-        logger.info("Бот запущен (webhook-шлюз: /telegram /notify /tick /healthz, порт %s)", PORT)
+        logger.info("Бот запущен (webhook-шлюз, порт %s)", PORT)
         await server.serve()
         await ptb.stop()
 
 
+async def _run_polling_gateway(ptb: Application) -> None:
+    """Основной режим (Amvera/РФ): Telegram-апдейты ИСХОДЯЩИМ polling'ом
+    (через прокси Amvera достижим), а HTTP-сервер держит /notify /tick /healthz
+    для доставки уведомлений Monitor и push'а платформы (их зовёт ВМ, ей вход открыт)."""
+    import uvicorn
+
+    asgi = _build_asgi(ptb)
+    server = uvicorn.Server(uvicorn.Config(
+        app=asgi, host="0.0.0.0", port=PORT, log_level="warning"))
+    async with ptb:                                  # initialize (+post_init)
+        # polling и webhook взаимоисключающи — снимаем webhook перед getUpdates.
+        await ptb.bot.delete_webhook(drop_pending_updates=False)
+        await ptb.start()
+        await ptb.updater.start_polling(allowed_updates=["message", "callback_query"])
+        logger.info("Бот запущен (polling + http: /notify /tick /healthz, порт %s)", PORT)
+        await server.serve()
+        await ptb.updater.stop()
+        await ptb.stop()
+
+
 def main() -> None:
-    if WEBHOOK_URL:
+    if os.getenv("VX_USE_WEBHOOK") and WEBHOOK_URL:
         if not WEBHOOK_SECRET or not TICK_KEY:
             raise RuntimeError("В webhook-режиме обязательны WEBHOOK_SECRET и TICK_KEY")
         asyncio.run(_run_webhook(build_application(webhook=True)))
     else:
-        logger.info("WEBHOOK_URL/RENDER_EXTERNAL_URL не задан — dev-режим: polling")
-        app = build_application(webhook=False)
-        logger.info("Бот запущен (dev polling)")
-        app.run_polling(allowed_updates=["message", "callback_query"])
+        # updater нужен для polling → build без updater(None)
+        asyncio.run(_run_polling_gateway(build_application(webhook=False)))
 
 
 if __name__ == "__main__":
