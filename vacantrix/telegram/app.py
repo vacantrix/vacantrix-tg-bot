@@ -268,7 +268,11 @@ async def _run_webhook(ptb: Application) -> None:
     asgi = _build_asgi(ptb)
     server = uvicorn.Server(uvicorn.Config(
         app=asgi, host="0.0.0.0", port=PORT, log_level="warning"))
-    async with ptb:                                  # initialize (+post_init)
+    async with ptb:                                  # initialize
+        # ⚠️ PTB зовёт post_init ТОЛЬКО в run_polling/run_webhook — в ручном
+        # ASGI-флоу (`async with`) его надо вызывать самим, иначе профиль
+        # бота (имя/описания/команды) никогда не обновится.
+        await post_init(ptb)
         await ptb.bot.set_webhook(
             url=f"{WEBHOOK_URL}/telegram",
             secret_token=WEBHOOK_SECRET,
@@ -290,7 +294,8 @@ async def _run_polling_gateway(ptb: Application) -> None:
     asgi = _build_asgi(ptb)
     server = uvicorn.Server(uvicorn.Config(
         app=asgi, host="0.0.0.0", port=PORT, log_level="warning"))
-    async with ptb:                                  # initialize (+post_init)
+    async with ptb:                                  # initialize
+        await post_init(ptb)                         # PTB сам НЕ зовёт (см. выше)
         # polling и webhook взаимоисключающи — снимаем webhook перед getUpdates.
         await ptb.bot.delete_webhook(drop_pending_updates=False)
         await ptb.start()
