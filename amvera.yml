@@ -1,0 +1,15 @@
+# Конфиг деплоя на Amvera Cloud (хостинг бота; см. CLAUDE.md).
+# Amvera сам проксирует трафик к api.telegram.org через зарубежный IP —
+# из РФ-региона Telegram работает без доп. настроек.
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: 3.12
+build:
+  requirementsPath: requirements.txt
+  useCache: true
+run:
+  scriptName: main.py
+  containerPort: 10000        # = PORT бота по умолчанию (uvicorn слушает 0.0.0.0:10000)
+  persistenceMount: /data
